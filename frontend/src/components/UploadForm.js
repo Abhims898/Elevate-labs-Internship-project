@@ -1,1 +1,0 @@
-// Upload form component
