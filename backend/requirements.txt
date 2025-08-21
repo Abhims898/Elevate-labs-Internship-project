@@ -1,5 +1,4 @@
 fastapi
-uvicorn
-cryptography
+uvicorn[standard]
 python-multipart
-jinja2
+cryptography
