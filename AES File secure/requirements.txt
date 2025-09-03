@@ -1,2 +1,0 @@
-PyQt5
-cryptography>=40.0
