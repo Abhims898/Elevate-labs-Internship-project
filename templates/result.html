@@ -28,11 +28,11 @@
         <div class="card-body">
           {% if action == 'encrypted' %}
             <h3 class="card-title">File encrypted ✔</h3>
-            <p class="card-text">Original filename: <strong>{{ orig_filename }}</strong></p>
-            <p class="card-text">Stored as: <strong>{{ stored_name }}</strong></p>
+            <p>Original filename: <strong>{{ orig_filename }}</strong></p>
+            <p>Stored as: <strong>{{ stored_name }}</strong></p>
           {% elif action == 'decrypted' %}
             <h3 class="card-title">File decrypted ✔</h3>
-            <p class="card-text">Filename: <strong>{{ orig_filename }}</strong></p>
+            <p>Filename: <strong>{{ orig_filename }}</strong></p>
           {% endif %}
 
           <ul class="list-unstyled">
@@ -55,13 +55,10 @@
     </div>
 
     <script>
-      // Auto-start the download
       (function(){
         const dl = document.getElementById('downloadLink');
         if(dl){
-          // attempt to open in a new tab (browsers may block), then click
           try { window.open(dl.href, '_self'); } catch(e) {}
-          // fallback: programmatically click
           setTimeout(()=>dl.click(), 250);
         }
       })();
