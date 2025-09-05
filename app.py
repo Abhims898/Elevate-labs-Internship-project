@@ -1,135 +1,255 @@
+# app.py
 import os
 import io
-import json
-import hashlib
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, send_file, flash, session
+import uuid
+from pathlib import Path
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    send_file, flash, session, abort
+)
 from werkzeug.utils import secure_filename
-from crypto import encrypt_file_aes, decrypt_file_aes
-
-app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24))
+from crypto import (
+    load_master_key_from_env,
+    encrypt_file_bytes,
+    decrypt_file_bytes,
+    generate_master_key_b64
+)
 
 # Config
-STORAGE_DIR = os.environ.get("SFS_STORAGE_DIR", "storage")
-MASTER_KEY = os.environ.get("SFS_MASTER_KEY")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+BASE = Path(__file__).parent
+STORAGE_DIR = Path(os.environ.get("SFS_STORAGE_DIR", str(BASE / "storage")))
+TEMP_DIR = Path(os.environ.get("SFS_TEMP_DIR", str(BASE / "temp")))
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-if not os.path.exists(STORAGE_DIR):
-    os.makedirs(STORAGE_DIR)
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24).hex())
 
-if not MASTER_KEY:
-    print("⚠️  WARNING: No SFS_MASTER_KEY set. Please export it before running.")
+# Admin auth (simple)
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")  # if set, login is required
 
-# -------- Authentication --------
+try:
+    MASTER_KEY = load_master_key_from_env()
+except Exception as e:
+    MASTER_KEY = None
+    print("Warning: MASTER_KEY not loaded:", e)
+
 def login_required(f):
     from functools import wraps
     @wraps(f)
     def decorated(*args, **kwargs):
         if ADMIN_PASSWORD and not session.get("logged_in"):
-            return redirect(url_for("login"))
+            flash("Please login first", "warning")
+            return redirect(url_for("login", next=request.path))
         return f(*args, **kwargs)
     return decorated
+
+@app.context_processor
+def inject_settings():
+    return dict(auth_enabled=bool(ADMIN_PASSWORD))
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        password = request.form.get("password")
-        if password == ADMIN_PASSWORD:
-            session["logged_in"] = True
-            flash("Login successful", "success")
-            return redirect(url_for("index"))
-        else:
-            flash("Invalid password", "danger")
+        pw = request.form.get("password", "")
+        if ADMIN_PASSWORD and pw == ADMIN_PASSWORD:
+            session['logged_in'] = True
+            flash("Logged in", "success")
+            nxt = request.args.get("next") or url_for("index")
+            return redirect(nxt)
+        flash("Invalid password", "danger")
     return render_template("login.html")
 
 @app.route("/logout")
 def logout():
     session.clear()
     flash("Logged out", "info")
-    return redirect(url_for("login"))
+    return redirect(url_for("index"))
 
-# -------- Routes --------
-@app.route("/", methods=["GET", "POST"])
-@login_required
+@app.route("/")
 def index():
-    if request.method == "POST":
-        file = request.files["file"]
-        if file:
-            filename = secure_filename(file.filename)
-            enc_path = os.path.join(STORAGE_DIR, filename + ".enc")
-            meta_path = enc_path + ".json"
-
-            ciphertext, iv, tag, key_hash = encrypt_file_aes(file.read(), MASTER_KEY, filename)
-
-            with open(enc_path, "wb") as f:
-                f.write(ciphertext)
-
-            metadata = {
-                "original_name": filename,
-                "encrypted_name": filename + ".enc",
-                "iv": iv.hex(),
-                "tag": tag.hex(),
-                "key_hash": key_hash,
-                "time": datetime.utcnow().isoformat(),
-                "sha256": hashlib.sha256(ciphertext).hexdigest(),
-            }
-            with open(meta_path, "w") as mf:
-                json.dump(metadata, mf)
-
-            flash(f"File '{filename}' encrypted successfully!", "success")
-            return redirect(url_for("list_files"))
     return render_template("index.html")
+
+@app.route("/generate-key", methods=["POST"])
+def generate_key():
+    # returns JSON with a base64 key for testing
+    return {"master_key": generate_master_key_b64()}
+
+@app.route("/upload", methods=["POST"])
+@login_required
+def upload():
+    if MASTER_KEY is None:
+        flash("Server error: master key not configured.", "danger")
+        return redirect(url_for('index'))
+
+    if 'file' not in request.files:
+        flash("No file part", "warning")
+        return redirect(url_for('index'))
+
+    f = request.files['file']
+    if f.filename == '':
+        flash("No selected file", "warning")
+        return redirect(url_for('index'))
+
+    filename = secure_filename(f.filename)
+    data = f.read()
+
+    package = encrypt_file_bytes(MASTER_KEY, filename, data)
+
+    out_name = filename + ".enc"
+    out_path = STORAGE_DIR / out_name
+    with open(out_path, "wb") as fh:
+        fh.write(package)
+
+    # Read metadata to show in result
+    try:
+        res = decrypt_file_bytes(MASTER_KEY, package)
+        meta = res["metadata"]
+    except Exception:
+        meta = {"orig_filename": filename}
+
+    # Render a result page that auto-starts download and shows link
+    return render_template("result.html",
+                            action="encrypted",
+                            stored_name=out_name,
+                            orig_filename=meta.get("orig_filename"),
+                            timestamp=meta.get("timestamp"),
+                            size=meta.get("size"),
+                            sha256=meta.get("sha256"),
+                            download_url=url_for("download_enc", stored_name=out_name)
+                           )
+
+@app.route("/decrypt", methods=["GET", "POST"])
+@login_required
+def decrypt_upload():
+    if request.method == "POST":
+        if MASTER_KEY is None:
+            flash("Server error: master key not configured.", "danger")
+            return redirect(url_for('decrypt_upload'))
+
+        if 'file' not in request.files:
+            flash("No file part", "warning")
+            return redirect(url_for('decrypt_upload'))
+
+        f = request.files['file']
+        if f.filename == '':
+            flash("No selected file", "warning")
+            return redirect(url_for('decrypt_upload'))
+
+        package_bytes = f.read()
+        try:
+            res = decrypt_file_bytes(MASTER_KEY, package_bytes)
+            meta = res["metadata"]
+            plaintext = res["plaintext"]
+            orig_name = secure_filename(meta.get("orig_filename", "decrypted.bin"))
+
+            # save to temp with token prefix
+            token = uuid.uuid4().hex
+            temp_fname = f"{token}_{orig_name}"
+            temp_path = TEMP_DIR / temp_fname
+            with open(temp_path, "wb") as tf:
+                tf.write(plaintext)
+
+            download_url = url_for("download_temp", token=token)
+            return render_template("result.html",
+                                   action="decrypted",
+                                   stored_name=temp_fname,
+                                   orig_filename=orig_name,
+                                   timestamp=meta.get("timestamp"),
+                                   size=meta.get("size"),
+                                   sha256=meta.get("sha256"),
+                                   download_url=download_url)
+        except Exception as e:
+            flash("Decryption failed: " + str(e), "danger")
+            return redirect(url_for('decrypt_upload'))
+
+    return render_template("decrypt.html")
+
+@app.route("/download-enc/<stored_name>")
+@login_required
+def download_enc(stored_name):
+    stored_name = secure_filename(stored_name)
+    file_path = STORAGE_DIR / stored_name
+    if not file_path.exists():
+        flash("File not found", "warning")
+        return redirect(url_for('list_files'))
+
+    return send_file(str(file_path), as_attachment=True, download_name=stored_name)
+
+@app.route("/download-temp/<token>")
+@login_required
+def download_temp(token):
+    # find file in TEMP_DIR that starts with token_
+    matches = list(TEMP_DIR.glob(f"{token}_*"))
+    if not matches:
+        flash("Temporary file not found or expired", "warning")
+        return redirect(url_for('index'))
+    p = matches[0]
+    # serve and then delete
+    try:
+        return send_file(str(p), as_attachment=True, download_name=p.name.split("_", 1)[1])
+    finally:
+        # try delete after sending (best-effort)
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 @app.route("/files")
 @login_required
 def list_files():
     files = []
-    for fname in os.listdir(STORAGE_DIR):
-        if fname.endswith(".enc"):
-            meta_path = os.path.join(STORAGE_DIR, fname + ".json")
-            if os.path.exists(meta_path):
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                files.append(meta)
+    for p in sorted(STORAGE_DIR.glob("*.enc")):
+        entry = {"stored_name": p.name}
+        try:
+            pkg = p.read_bytes()
+            meta = decrypt_file_bytes(MASTER_KEY, pkg)["metadata"] if MASTER_KEY else {}
+            entry.update({
+                "orig_filename": meta.get("orig_filename"),
+                "timestamp": meta.get("timestamp"),
+                "size": meta.get("size"),
+                "sha256": meta.get("sha256")
+            })
+        except Exception as e:
+            entry["error"] = str(e)
+        files.append(entry)
     return render_template("files.html", files=files)
 
-@app.route("/decrypt", methods=["GET", "POST"])
+@app.route("/download-decrypted/<stored_name>")
 @login_required
-def decrypt_file():
-    if request.method == "POST":
-        file = request.files["file"]
-        if file:
-            enc_path = os.path.join(STORAGE_DIR, "temp_upload.enc")
-            file.save(enc_path)
-
-            try:
-                original_name, plaintext = decrypt_file_aes(enc_path, MASTER_KEY)
-                os.remove(enc_path)
-                return send_file(
-                    io.BytesIO(plaintext),
-                    as_attachment=True,
-                    download_name=original_name,
-                )
-            except Exception as e:
-                flash("Decryption failed: " + str(e), "danger")
-                return redirect(url_for("decrypt_file"))
-    return render_template("decrypt.html")
-
-@app.route("/delete/<filename>", methods=["POST"])
-@login_required
-def delete_file(filename):
-    enc_path = os.path.join(STORAGE_DIR, filename)
-    meta_path = enc_path + ".json"
+def download_decrypted(stored_name):
+    stored_name = secure_filename(stored_name)
+    file_path = STORAGE_DIR / stored_name
+    if not file_path.exists():
+        flash("File not found", "warning")
+        return redirect(url_for('list_files'))
     try:
-        if os.path.exists(enc_path):
-            os.remove(enc_path)
-        if os.path.exists(meta_path):
-            os.remove(meta_path)
-        flash(f"Deleted {filename}", "success")
+        pkg = file_path.read_bytes()
+        res = decrypt_file_bytes(MASTER_KEY, pkg)
+        meta = res["metadata"]
+        plaintext = res["plaintext"]
+        return send_file(io.BytesIO(plaintext),
+                         as_attachment=True,
+                         download_name=meta.get("orig_filename"),
+                         mimetype="application/octet-stream")
+    except Exception as e:
+        flash("Decrypt/verify failed: " + str(e), "danger")
+        return redirect(url_for('list_files'))
+
+@app.route("/delete/<stored_name>", methods=["POST"])
+@login_required
+def delete_file(stored_name):
+    stored_name = secure_filename(stored_name)
+    file_path = STORAGE_DIR / stored_name
+    try:
+        if file_path.exists():
+            file_path.unlink()
+            flash(f"Deleted {stored_name}", "success")
+        else:
+            flash("File not found", "warning")
     except Exception as e:
         flash("Error deleting file: " + str(e), "danger")
-    return redirect(url_for("list_files"))
+    return redirect(url_for('list_files'))
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
